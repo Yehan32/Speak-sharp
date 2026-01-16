@@ -4,7 +4,7 @@ import 'package:http/http.dart' as http;
 import 'package:http_parser/http_parser.dart';
 
 class AudioAnalysisService {
-  static const String baseUrl = 'https://project-vocallabs-production.up.railway.app';
+  static const String baseUrl = 'http://localhost:8000';
 
   /// Uploads audio data and returns the analysis results
   static Future<Map<String, dynamic>> analyzeAudio({
