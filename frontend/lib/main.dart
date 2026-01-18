@@ -27,6 +27,7 @@ import 'package:frontend/screens/settings/settings_screen.dart';
 import 'package:frontend/screens/settings/notification_center_screen.dart';
 import 'package:frontend/screens/settings/payment_screen.dart';
 
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp();
