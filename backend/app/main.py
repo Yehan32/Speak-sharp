@@ -27,7 +27,7 @@ load_dotenv()
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="VocalLabs API",
+    title="Speak Sharp API",
     description="Speech analysis and feedback API",
     version="1.0.0"
 )
@@ -61,7 +61,7 @@ async def startup_event():
 async def root():
     """Root endpoint - simple health check"""
     return {
-        "message": "VocalLabs API is running!",
+        "message": "Speak Sharp API is running!",
         "status": "healthy",
         "endpoints": {
             "analyze": "/analyze",
