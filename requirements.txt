@@ -1,10 +1,9 @@
-fastapi
+﻿fastapi
 uvicorn
 openai-whisper
 librosa
 pydub
 praat-parselmouth
-webrtcvad
 sqlalchemy
 databases
 passlib[bcrypt]

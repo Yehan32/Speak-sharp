@@ -1,253 +1,331 @@
-"""
-VocalLabs Backend API - Main Application Entry Point
-A modern speech analysis and feedback system for Toastmasters and public speakers
-"""
-
+import os
+import whisper
+import librosa
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import uvicorn
-from pathlib import Path
 import tempfile
-import os
-from typing import Optional
+import traceback
+from dotenv import load_dotenv
 
-from app.core.config import get_settings
-from app.services.speech_analyzer_service import SpeechAnalyzerService
-from app.services.firebase_service import FirebaseService
-from app.utils.logger import get_logger
+# Import all our ML models
+from app.models import (
+    filler_word_detection,
+    proficiency_evaluation,
+    transcript,
+    voice_modulation,
+    speech_development,
+    speech_effectiveness,
+    vocabulary_evaluation
+)
 
-# Initialize settings and logger
-settings = get_settings()
-logger = get_logger(__name__)
+# Import Firebase
+from app.firebase_config import db
+
+# Load environment variables
+load_dotenv()
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="Speak Sharp API",
-    description="AI-Powered Speech Analysis and Feedback Platform",
-    version="2.0.0",
-    docs_url="/api/docs",
-    redoc_url="/api/redoc"
+    title="VocalLabs API",
+    description="Speech analysis and feedback API",
+    version="1.0.0"
 )
 
-# Configure CORS
+# Configure CORS (allows Flutter app to call this API)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure this properly in production
+    allow_origins=["*"],  # In production, specify exact origins
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialize services
-speech_service = SpeechAnalyzerService()
-firebase_service = FirebaseService()
-
+# Global variable for Whisper model
+whisper_model = None
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize services on startup"""
-    logger.info("Speak Sharp API starting up...")
-    logger.info(f"Environment: {settings.ENVIRONMENT}")
-    logger.info(f"Debug Mode: {settings.DEBUG}")
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Cleanup on shutdown"""
-    logger.info("Speak Sharp API shutting down...")
-
+    """Load Whisper model when server starts"""
+    global whisper_model
+    print("Loading Whisper model...")
+    try:
+        # Load Whisper base model (good balance of speed and accuracy)
+        whisper_model = whisper.load_model("base")
+        print("Whisper model loaded successfully!")
+    except Exception as e:
+        print(f"Error loading Whisper model: {e}")
+        raise
 
 @app.get("/")
 async def root():
-    """Root endpoint - API health check"""
+    """Root endpoint - simple health check"""
     return {
-        "status": "online",
-        "service": "Speak Sharp API",
-        "version": "2.0.0",
-        "message": "Speech Analysis API is running"
-    }
-
-
-@app.get("/health")
-async def health_check():
-    """Detailed health check endpoint"""
-    return {
+        "message": "VocalLabs API is running!",
         "status": "healthy",
-        "services": {
-            "api": "operational",
-            "ml_engine": "operational",
-            "firebase": "operational"
+        "endpoints": {
+            "analyze": "/analyze",
+            "health": "/health"
         }
     }
 
+@app.get("/health")
+async def health_check():
+    """Detailed health check"""
+    return {
+        "status": "healthy",
+        "whisper_model_loaded": whisper_model is not None,
+        "firebase_connected": True  # Assumes firebase_config.py ran successfully
+    }
 
-@app.post("/api/v2/analyze")
+@app.post("/analyze")
 async def analyze_speech(
-    file: UploadFile = File(...),
-    user_id: str = Form(...),
+    audio: UploadFile = File(...),
     topic: str = Form(...),
-    speech_type: str = Form(...),
     expected_duration: str = Form(...),
-    actual_duration: str = Form(...),
-    gender: Optional[str] = Form(None)
+    user_id: str = Form(...)
 ):
     """
-    Analyze uploaded speech audio
+    Main endpoint to analyze speech.
     
     Args:
-        file: Audio file (wav, mp3, m4a, ogg)
-        user_id: User identifier
-        topic: Speech topic
-        speech_type: Type of speech
-        expected_duration: Expected duration range (e.g., "5-7 minutes")
-        actual_duration: Actual recording duration
-        gender: Speaker gender (optional, auto-detected if not provided)
-    
+        audio: Audio file (WAV, MP3, etc.)
+        topic: Speech topic/title
+        expected_duration: Expected duration (e.g., "5-7 minutes")
+        user_id: Firebase user ID
+        
     Returns:
-        Comprehensive speech analysis results
+        Complete analysis with scores and feedback
     """
-    temp_file_path = None
+    temp_audio_path = None
     
     try:
-        logger.info(f"Received analysis request from user: {user_id}")
-        logger.info(f"Topic: {topic}, Type: {speech_type}")
+        # Validate inputs
+        if not audio.filename:
+            raise HTTPException(status_code=400, detail="No audio file provided")
         
-        # Validate file type
-        if not file.filename:
-            raise HTTPException(status_code=400, detail="No filename provided")
-        
-        file_ext = Path(file.filename).suffix.lower()
-        if file_ext not in ['.wav', '.mp3', '.m4a', '.ogg']:
+        # Check file extension
+        allowed_extensions = ['.wav', '.mp3', '.m4a', '.flac', '.ogg']
+        file_ext = os.path.splitext(audio.filename)[1].lower()
+        if file_ext not in allowed_extensions:
             raise HTTPException(
-                status_code=400,
-                detail=f"Unsupported file type: {file_ext}. Supported: .wav, .mp3, .m4a, .ogg"
+                status_code=400, 
+                detail=f"Invalid file type. Allowed: {', '.join(allowed_extensions)}"
             )
+        
+        print(f"\n{'='*50}")
+        print(f"Starting analysis for user: {user_id}")
+        print(f"Topic: {topic}")
+        print(f"Expected duration: {expected_duration}")
+        print(f"{'='*50}\n")
         
         # Save uploaded file temporarily
         with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as temp_file:
-            temp_file_path = temp_file.name
-            content = await file.read()
+            temp_audio_path = temp_file.name
+            content = await audio.read()
             temp_file.write(content)
         
-        logger.info(f"Saved temporary file: {temp_file_path}")
+        print(f"Audio file saved to: {temp_audio_path}")
         
-        # Perform speech analysis
-        logger.info("Starting speech analysis...")
-        analysis_result = await speech_service.analyze_speech(
-            audio_path=temp_file_path,
-            user_id=user_id,
-            topic=topic,
-            speech_type=speech_type,
-            expected_duration=expected_duration,
-            actual_duration=actual_duration,
-            gender=gender or 'auto'
+        # === STEP 1: TRANSCRIPTION ===
+        print("\nStep 1: Transcribing audio...")
+        transcription_result = transcript.transcribe_audio(whisper_model, temp_audio_path)
+        transcription_with_pauses, number_of_pauses = transcript.process_transcription(transcription_result)
+        print(f"Transcription complete. Found {number_of_pauses} pauses.")
+        
+        # === STEP 2: GET AUDIO DURATION ===
+        print("\nStep 2: Getting audio duration...")
+        y, sr = librosa.load(temp_audio_path)
+        actual_duration = librosa.get_duration(y=y, sr=sr)
+        actual_duration_str = f"{int(actual_duration // 60)}:{int(actual_duration % 60):02d}"
+        print(f" Duration: {actual_duration_str} ({actual_duration:.1f} seconds)")
+        
+        # === STEP 3: FILLER WORD ANALYSIS ===
+        print("\nStep 3: Analyzing filler words...")
+        filler_analysis = filler_word_detection.analyze_filler_words(transcription_result)
+        print(f"Found {filler_analysis['Total Filler Words']} filler words")
+        
+        # === STEP 4: PAUSE ANALYSIS ===
+        print("\nStep 4: Analyzing pauses...")
+        pause_analysis = filler_word_detection.analyze_mid_sentence_pauses(transcription_with_pauses)
+        print(f"Pause analysis complete")
+        
+        # === STEP 5: PROFICIENCY SCORE ===
+        print("\nStep 5: Calculating proficiency score...")
+        proficiency_result = proficiency_evaluation.calculate_proficiency_score(
+            filler_analysis,
+            pause_analysis,
+            actual_duration_str,
+            expected_duration
         )
+        print(f"Proficiency score: {proficiency_result['final_score']}/20")
         
-        logger.info("Analysis completed successfully")
+        # === STEP 6: VOICE MODULATION ===
+        print("\nStep 6: Analyzing voice modulation...")
+        modulation_result = voice_modulation.analyze_voice_modulation(temp_audio_path)
         
-        # Upload audio to Firebase Storage
-        logger.info("Uploading audio to Firebase...")
-        audio_url = await firebase_service.upload_audio(
-            file_path=temp_file_path,
-            user_id=user_id,
-            filename=file.filename
+        if 'error' in modulation_result:
+            print(f"Voice modulation error: {modulation_result['error']}")
+            modulation_score = 10.0  # Default score
+        else:
+            modulation_score = modulation_result['scores']['total_score']
+            print(f"Voice modulation score: {modulation_score}/20")
+        
+        # === STEP 7: SPEECH DEVELOPMENT ===
+        print("\nStep 7: Evaluating speech development...")
+        development_result = speech_development.evaluate_speech_development(
+            transcription_with_pauses,
+            actual_duration,
+            expected_duration
         )
-        analysis_result['audio_url'] = audio_url
+        development_score = development_result['structure']['score'] + development_result['time_utilization']['score']
+        print(f"Speech development score: {development_score}/20")
         
-        # Save analysis to Firestore
-        logger.info("Saving analysis to Firestore...")
-        await firebase_service.save_speech_analysis(
-            user_id=user_id,
-            analysis_data=analysis_result,
-            topic=topic,
-            speech_type=speech_type,
-            actual_duration=actual_duration
+        # === STEP 8: SPEECH EFFECTIVENESS ===
+        print("\nStep 8: Evaluating speech effectiveness...")
+        effectiveness_result = speech_effectiveness.evaluate_speech_effectiveness(
+            transcription_with_pauses,
+            topic,
+            expected_duration,
+            actual_duration
         )
+        effectiveness_score = effectiveness_result['total_score']
+        print(f"Speech effectiveness score: {effectiveness_score}/20")
         
-        logger.info("Speech analysis pipeline completed successfully")
+        # === STEP 9: VOCABULARY EVALUATION ===
+        print("\nStep 9: Evaluating vocabulary...")
+        vocabulary_result = vocabulary_evaluation.evaluate_speech(
+            transcription_result,
+            transcription_with_pauses,
+            temp_audio_path,
+            topic
+        )
+        # Convert from 0-100 scale to 0-20 scale
+        vocabulary_score = (vocabulary_result['vocabulary_score'] / 100) * 20
+        print(f"Vocabulary score: {vocabulary_score}/20")
         
-        return JSONResponse(content=analysis_result, status_code=200)
-    
+        # === STEP 10: CALCULATE OVERALL SCORE ===
+        print("\nStep 10: Calculating overall score...")
+        overall_score = (
+            proficiency_result['final_score'] +
+            modulation_score +
+            development_score +
+            effectiveness_score +
+            vocabulary_score
+        )
+        print(f"Overall score: {overall_score}/100")
+        
+        # === STEP 11: COMPILE RESULTS ===
+        print("\n Step 11: Compiling results...")
+        
+        results = {
+            "overall_score": round(overall_score, 1),
+            "scores": {
+                "proficiency": round(proficiency_result['final_score'], 1),
+                "voice_modulation": round(modulation_score, 1),
+                "speech_development": round(development_score, 1),
+                "speech_effectiveness": round(effectiveness_score, 1),
+                "vocabulary": round(vocabulary_score, 1)
+            },
+            "transcription": transcription_with_pauses,
+            "duration": {
+                "actual": actual_duration_str,
+                "expected": expected_duration,
+                "seconds": round(actual_duration, 1)
+            },
+            "filler_analysis": {
+                "total_filler_words": filler_analysis['Total Filler Words'],
+                "filler_density": round(filler_analysis['Filler Density'], 3),
+                "filler_per_minute": filler_analysis['Filler Words Per Minute']
+            },
+            "pause_analysis": pause_analysis,
+            "proficiency_details": proficiency_result,
+            "voice_modulation_details": modulation_result if 'error' not in modulation_result else {},
+            "speech_development_details": development_result,
+            "speech_effectiveness_details": effectiveness_result,
+            "vocabulary_details": {
+                "lexical_diversity": vocabulary_result.get('lexical_diversity', 0),
+                "unique_words": vocabulary_result.get('unique_words', 0),
+                "advanced_vocab_count": vocabulary_result.get('advanced_vocab_count', 0),
+                "feedback": vocabulary_result.get('feedback', [])
+            },
+            "topic": topic,
+            "user_id": user_id
+        }
+        
+        print(f"\n{'='*50}")
+        print("ANALYSIS COMPLETE!")
+        print(f"{'='*50}\n")
+        
+        # === STEP 12: SAVE TO FIREBASE (OPTIONAL) ===
+        # Uncomment if you want to save results to Firestore
+        # try:
+        #     doc_ref = db.collection('speeches').add(results)
+        #     print(f"Saved to Firebase with ID: {doc_ref[1].id}")
+        # except Exception as e:
+        #     print(f" Firebase save error: {e}")
+        
+        return JSONResponse(content=results)
+        
     except Exception as e:
-        logger.error(f"Analysis failed: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
-    
+        # Log the full error
+        print(f"\nERROR in analysis:")
+        print(traceback.format_exc())
+        
+        # Return error response
+        raise HTTPException(
+            status_code=500,
+            detail=f"Analysis failed: {str(e)}"
+        )
+        
     finally:
-        # Cleanup temporary file
-        if temp_file_path and os.path.exists(temp_file_path):
+        # Clean up temporary file
+        if temp_audio_path and os.path.exists(temp_audio_path):
             try:
-                os.remove(temp_file_path)
-                logger.info(f"Cleaned up temporary file: {temp_file_path}")
+                os.unlink(temp_audio_path)
+                print(f"Cleaned up temporary file")
             except Exception as e:
-                logger.warning(f"Failed to cleanup temp file: {e}")
+                print(f" Could not delete temp file: {e}")
 
-
-@app.post("/api/v2/quick-analyze")
-async def quick_analyze(
-    file: UploadFile = File(...),
-    gender: Optional[str] = Form(None)
+@app.post("/save-speech")
+async def save_speech_to_firebase(
+    user_id: str = Form(...),
+    speech_data: str = Form(...)
 ):
     """
-    Quick speech analysis without saving to database
-    Useful for testing and preview
+    Save speech analysis to Firebase Firestore.
+    
+    Args:
+        user_id: Firebase user ID
+        speech_data: JSON string of speech data
+        
+    Returns:
+        Success message with document ID
     """
-    temp_file_path = None
-    
     try:
-        # Save file temporarily
-        file_ext = Path(file.filename).suffix.lower() if file.filename else '.wav'
-        with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as temp_file:
-            temp_file_path = temp_file.name
-            content = await file.read()
-            temp_file.write(content)
+        import json
+        data = json.loads(speech_data)
         
-        # Quick analysis (subset of full analysis)
-        result = await speech_service.quick_analyze(
-            audio_path=temp_file_path,
-            gender=gender or 'auto'
+        # Add to Firestore
+        doc_ref = db.collection('speeches').document()
+        doc_ref.set({
+            'user_id': user_id,
+            'timestamp': firestore.SERVER_TIMESTAMP,
+            **data
+        })
+        
+        return {
+            "success": True,
+            "document_id": doc_ref.id,
+            "message": "Speech saved successfully"
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to save speech: {str(e)}"
         )
-        
-        return JSONResponse(content=result, status_code=200)
-    
-    except Exception as e:
-        logger.error(f"Quick analysis failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-    
-    finally:
-        if temp_file_path and os.path.exists(temp_file_path):
-            try:
-                os.remove(temp_file_path)
-            except:
-                pass
-
-
-@app.get("/api/v2/user/{user_id}/speeches")
-async def get_user_speeches(user_id: str, limit: int = 20):
-    """Retrieve user's speech history"""
-    try:
-        speeches = await firebase_service.get_user_speeches(user_id, limit=limit)
-        return JSONResponse(content={"speeches": speeches}, status_code=200)
-    except Exception as e:
-        logger.error(f"Failed to retrieve speeches: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/v2/user/{user_id}/stats")
-async def get_user_stats(user_id: str):
-    """Get user statistics and progress"""
-    try:
-        stats = await firebase_service.get_user_statistics(user_id)
-        return JSONResponse(content=stats, status_code=200)
-    except Exception as e:
-        logger.error(f"Failed to retrieve stats: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "app.main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=settings.DEBUG
-    )
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
